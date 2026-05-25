@@ -1,0 +1,89 @@
+# Build artifacts
+build/
+build-*/
+out/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.map
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+Testing/
+compile_commands.json
+
+# IDE / Editor
+.vscode/
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.iml
+.cache/
+.ccls-cache/
+.clangd/
+
+# Generated / runtime
+*.log
+*.gguf
+*.bin
+*.safetensors
+*.lora
+*.ckpt
+checkpoints/
+adapters/
+data/raw/
+data/cache/
+data/tokenized/
+.slate-cache/
+
+# Python tooling
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.tox/
+.pytest_cache/
+
+# Test outputs
+test-results/
+coverage/
+*.gcov
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# Profiling
+perf.data*
+callgrind.out.*
+massif.out.*
+gmon.out
+
+# Documentation build
+docs/_build/
+docs/site/
+docs/api/html/
+
+# OS-specific
+.fuse_hidden*
+.Trash-*
+$RECYCLE.BIN/
