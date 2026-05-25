@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The Slate Authors
 //
-// add_bias.c — y[..., c] = x[..., c] + b[c].
-//
-// Treats x as [N, C] where N is the product of leading dims. Backward sums
-// upstream gradient over N into b's grad.
+// add_bias.c — y[..., c] = x[..., c] + b[c].  AVX2 SIMD broadcast-add.
 
 #include "slate/ops.h"
 #include "slate/tensor.h"
 #include "slate/autograd.h"
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 static void add_bias_backward(slate_graph_node_t* node) {
     slate_tensor_t* x = node->inputs[0];
@@ -21,13 +22,33 @@ static void add_bias_backward(slate_graph_node_t* node) {
     if (x->requires_grad && x->grad) {
         float* d_x = (float*)x->grad;
         int64_t n = slate_tensor_numel(out);
+#if defined(__AVX2__)
+        int64_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            __m256 dxv = _mm256_loadu_ps(d_x + i);
+            __m256 dyv = _mm256_loadu_ps(d_out + i);
+            _mm256_storeu_ps(d_x + i, _mm256_add_ps(dxv, dyv));
+        }
+        for (; i < n; ++i) d_x[i] += d_out[i];
+#else
         for (int64_t i = 0; i < n; ++i) d_x[i] += d_out[i];
+#endif
     }
     if (b->requires_grad && b->grad) {
         float* d_b = (float*)b->grad;
         for (int64_t i = 0; i < N; ++i) {
             const float* row = d_out + i * C;
+#if defined(__AVX2__)
+            int64_t c = 0;
+            for (; c + 8 <= C; c += 8) {
+                __m256 dbv = _mm256_loadu_ps(d_b + c);
+                __m256 rv  = _mm256_loadu_ps(row + c);
+                _mm256_storeu_ps(d_b + c, _mm256_add_ps(dbv, rv));
+            }
+            for (; c < C; ++c) d_b[c] += row[c];
+#else
             for (int64_t c = 0; c < C; ++c) d_b[c] += row[c];
+#endif
         }
     }
 }
@@ -52,7 +73,17 @@ slate_tensor_t* slate_op_add_bias(slate_graph_ctx_t* ctx,
     for (int64_t n = 0; n < N; ++n) {
         const float* row = px + n * C;
         float* orow = po + n * C;
+#if defined(__AVX2__)
+        int64_t c = 0;
+        for (; c + 8 <= C; c += 8) {
+            __m256 xv = _mm256_loadu_ps(row + c);
+            __m256 bv = _mm256_loadu_ps(pb  + c);
+            _mm256_storeu_ps(orow + c, _mm256_add_ps(xv, bv));
+        }
+        for (; c < C; ++c) orow[c] = row[c] + pb[c];
+#else
         for (int64_t c = 0; c < C; ++c) orow[c] = row[c] + pb[c];
+#endif
     }
 
     slate_tensor_t* inputs[2] = {x, b};

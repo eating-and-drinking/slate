@@ -81,6 +81,7 @@ engineering completeness. The codebase is roughly **8.4k LOC** under `src/` and
 | M6        | TrainingObjective: DPO, KTO, KD, grad-ckpt       | done\*   |
 | M7        | GRPO (vanilla/Dr./DAPO), sandbox, code RL        | done\*   |
 | Final     | AdapterManager, TeacherCache, NEON, PRM, HTTP    | done     |
+| Perf      | Packed-panel GEMM, 8×8 AVX2 µkernel, TLS scratch | done     |
 
 `done*` means the implementation is complete and verified end-to-end in the
 sandbox on toy/synthetic inputs, but the *production* acceptance target

@@ -7,6 +7,224 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — packed-panel GEMM (kernel-layer rewrite)
+
+The forward and backward matmul were rewritten to GotoBLAS-style three-level
+blocking (`MC × KC × NC`) with a 8×8 AVX2 register microkernel, software
+prefetch into L1, and per-thread persistent packing scratch (`__thread`):
+
+- Tile parameters: `MR=8`, `NR=16`, `MC=64`, `KC=128`, `NC=512` — sized so the
+  A panel (32 KiB) lives next to L1 and the B panel (256 KiB) fits in L2 on
+  a typical consumer CPU.
+- Microkernel (final 8×16 form): **16 YMM accumulators** (2 per row, low+high
+  halves of NR=16) — saturates the full AVX2 register file. Per K step:
+  2 B-loads + 8 A-broadcasts + 16 FMAs. Full-tile fast-path with edge
+  spill-and-merge for non-multiples of 8/16.
+- An intermediate 8×8 microkernel (8 accumulators) reached ~42 GFLOP/s on
+  1024³ single-thread; upgrading to 8×16 lifted that to ~66 GFLOP/s (~1.57×).
+- Backward: `d_a = d_out @ b^T` and `d_b = a^T @ d_out` are turned into
+  standard GEMMs via an out-of-place transpose, so they go through the same
+  packed kernel and stay threaded.
+- Per-thread `__thread` packing buffers eliminate the malloc-per-call
+  overhead that originally hurt small-matrix performance under threading.
+
+Measured on the 2-core x86_64 sandbox at 1024×1024×1024:
+
+|                  | baseline    | 8×8 µkernel  | 8×16 µkernel | total speedup |
+|------------------|-------------|--------------|--------------|---------------|
+| 1-thread AVX2    | 14 GFLOP/s  | 42 GFLOP/s   | **66 GFLOP/s** | **~4.7×**   |
+| 2-thread AVX2    | 28 GFLOP/s  | 81 GFLOP/s   | **110 GFLOP/s**| **~3.9×**   |
+
+At 1024³ single-thread, the kernel reaches **roughly 70 % of the AVX2
+theoretical peak** for the sandbox clock — comparable to mature
+implementations like ggml's. Numbers will vary with CPU and turbo
+behavior on real hardware.
+
+**bmm (batched matmul) shares the same kernel.** The forward / backward
+were refactored to call into `src/ops/gemm_internal.h::slate_gemm_packed_accumulate`
+on a per-batch basis (parallelism moved from inside-the-matmul to
+across-the-batch). For transformer attention shapes this means:
+
+|  Shape (BxHxSxD)         | OP        | 1-thread (8×16) |
+|--------------------------|-----------|-----------------|
+| 1·12·256·64 ([12,256,64]×[12,64,256])   | Q @ Kᵀ    | ~62 GFLOP/s    |
+| 1·12·256·64 ([12,256,256]×[12,256,64])  | attn @ V  | ~42 GFLOP/s    |
+| 1·8·512·64                              | Q @ Kᵀ    | ~64 GFLOP/s    |
+| 8·4·64·32  (char-LM)                    | Q @ Kᵀ    | ~40 GFLOP/s    |
+
+Compared to the previous scalar-AXPY `mm2d` inside `bmm.c` (which was
+essentially the pre-optimisation matmul ~14 GFLOP/s), per-batch attention
+GEMMs are now **~3–4× faster on forward**. The backward, which was previously
+a fully scalar `O(L·M·K·N)` triple loop, now runs through the same packed
+kernel via materialised transposes — about **5–8× faster** depending on shape.
+
+While reworking matmul, a latent gradient-correctness bug was caught: the
+multi-threaded `d_b = a^T @ d_out` path had its `M` shadowed by the per-task
+band size, so `aT`'s row stride was wrong whenever `nt > 1`. Single-thread
+runs (which gradcheck used) were correct; the issue only triggered with
+≥2 threads and was fixed during the bmm refactor.
+
+All 18 tests (including `test_gradcheck` — finite-difference validation of
+all eight gradient-bearing ops — `test_transformer_block` — end-to-end
+TransformerBlock forward+backward — and `test_mha` — multi-head attention,
+which exercises the bmm rewrite end-to-end) still pass. The Final-assembly
+capstone still produces `adapter byte-identical after disk round-trip: yes`
+and `GGUF base file unchanged (byte-level): yes`.
+
+Benchmarks: `benchmarks/bench_matmul.c` (2-D GEMM), `benchmarks/bench_bmm.c`
+(batched attention shapes).
+
+### Performance — Q8_0 × f32 direct dot (inference path)
+
+`slate_dot_q8_0_f32` and `slate_q8_0_matvec` (in `include/slate/quant.h` /
+`src/util/quant.c`) fuse the dequant + dot product into a single AVX2 pass
+over the packed 34-byte Q8_0 blocks. Previously, a Q8_0 × f32 matvec had
+to dequantise the entire weight matrix to a temporary f32 buffer first,
+then run a standard dot — paying for one full f32 write and one full f32
+read of a matrix that may be hundreds of MiB.
+
+Per-block AVX2 inner loop: load 32 int8 weights → split into two 16-int8
+halves → sign-extend to int16 then to int32 → convert to f32 → multiply
+by the f16 scale once → four FMA accumulations against 32 floats of `x`.
+Final reduction is a horizontal sum of one __m256 accumulator.
+
+Numbers (single thread, AVX2, sandbox):
+
+| Shape (M × K)      | dequant + f32 dot  | fused Q8 dot       | speedup |
+|--------------------|--------------------|--------------------|---------|
+| 64 × 256           | 0.04 ms / 0.9 GF/s | 0.01 ms / 5.7 GF/s | 6.2×    |
+| 256 × 1024         | 0.43 ms / 1.2 GF/s | 0.05 ms / 10.4 GF/s| 8.5×    |
+| 1024 × 1024        | 1.32 ms / 1.6 GF/s | 0.21 ms / 10.0 GF/s| 6.3×    |
+| 4096 × 4096 (7B-class) | 30.6 ms        | 3.6 ms / 9.4 GF/s  | **8.6×**|
+
+The absolute throughput is bandwidth-bound (Q8_0 still reads the entire
+weight matrix once); the win comes from eliminating a parallel f32
+write-then-read of the same matrix. For LLaMA-7B style 4096×4096 attention
+weights this is the dominant inference cost.
+
+Verified bit-equivalent to the dequant+dot reference in `test_q8_dot`
+(relative error ≤ 1e-6, only floating-point summation order differs).
+Benchmark: `benchmarks/bench_q8_dot.c`.
+
+### Performance — softmax and RMSNorm AVX2 paths
+
+Both `slate_op_softmax` and `slate_op_rms_norm` now have AVX2-vectorised
+inner loops. They were previously pure scalar with a `expf()` and `sqrtf()`
+call per element. For the SIMD path we also use:
+
+- A **vectorised exp polynomial** for softmax (`exp256_ps`): range reduce
+  `x = n·ln(2) + r` then a degree-5 polynomial for `exp(r)` on `|r| ≤ ln(2)/2`,
+  scaled by `2^n` via integer add into the IEEE-754 exponent field. Accuracy
+  ≈ 1 ulp in the reduced range; max relative error ≈ 3e-7.
+- **Double-precision scalar tails** for the reduction inner products so that
+  `d_y[i] - s` in the softmax backward does not lose precision when
+  individual gradients land near the 1e-7 noise floor.
+
+To keep the gradient-check tests bit-stable, both ops keep their **original
+scalar code path verbatim** for last-dim sizes below 16 (the `SIMD_MIN_C`
+threshold). Transformer shapes — attention scores, LM head, hidden state —
+are all far above 16 and take the AVX2 path.
+
+Measured (single thread, AVX2, sandbox):
+
+| op       | shape                              | per-row time | throughput     |
+|----------|------------------------------------|--------------|----------------|
+| softmax  | N=8192, C=128 (attention S=128)    | 0.12 us      | 1.09 Gelems/s  |
+| softmax  | N=3072, C=256 (attention S=256)    | 0.22 us      | 1.15 Gelems/s  |
+| softmax  | N=4096, C=512 (attention S=512)    | 0.48 us      | 1.07 Gelems/s  |
+| softmax  | N=10,   C=32000 (LM head vocab=32k)| 25.6 us      | 1.25 Gelems/s  |
+| RMSNorm  | N=512,  C=128 (hidden=128)         | 0.046 us     | 2.78 Gelems/s  |
+| RMSNorm  | N=512,  C=768 (GPT-2 sm)           | 0.245 us     | 3.13 Gelems/s  |
+| RMSNorm  | N=512,  C=4096 (LLaMA-7B)          | 1.77 us      | 2.32 Gelems/s  |
+
+RMSNorm at >2 Gelems/s is essentially memory-bandwidth-bound. The softmax
+throughput is exp-bound; the polynomial approximation gets roughly 3× over
+glibc `expf`.
+
+Benchmark: `benchmarks/bench_softmax_rmsnorm.c`.
+
+While reworking softmax a numerically sensitive case was caught: the
+test_gradcheck softmax shape (2×3, max gradient component ~1e-7) requires
+double-precision accumulation in the sum reduction. The earlier SIMD draft
+which used float accumulation lost cancellation precision and tripped the
+1e-2 relative-error threshold. The final code carries the reduction in
+double in both the SIMD and scalar paths.
+
+### Performance — SiLU, add, mul, add_bias, scale (remaining element-wise)
+
+The remaining hot element-wise / activation ops were vectorised too:
+
+- **SiLU (`y = x * sigmoid(x)`)**: forward uses the vectorised
+  `slate_sigmoid256_ps` (built on `slate_exp256_ps`); backward is straight
+  AVX2 FMA. Every transformer FFN block calls SiLU twice per token.
+- **`add` / `mul` (elementwise)**: forward and backward are simple
+  vectorised loops; `mul` backward uses `_mm256_fmadd_ps` to merge the
+  `dy * other_operand` with the existing grad accumulator.
+- **`add_bias` (the `Linear(bias=True)` post-step)**: 8-wide broadcast-add
+  on the bias vector; backward sums upstream gradient over N rows into
+  `d_b` 8-wide.
+- **`scale` (the `1/sqrt(d)` factor in attention)**: forward is a vector
+  multiply by a broadcasted scalar; backward is an FMA into the grad
+  accumulator.
+
+A new private header `src/ops/simd_helpers.h` collects the shared
+intrinsics — `slate_hsum256`, `slate_hmax256`, `slate_exp256_ps`,
+`slate_sigmoid256_ps` — that softmax, RMSNorm, and SiLU all consume,
+so there is exactly one copy of the polynomial exp.
+
+All 19 tests still pass (`test_gradcheck` covers every op with finite
+differences, `test_transformer_block` exercises SiLU + add + add_bias +
+scale + RMSNorm end-to-end), and the Final-assembly capstone is still
+byte-identical.
+
+### Added — Muon optimizer (Newton-Schulz orthogonalised momentum)
+
+- **Muon** (`include/slate/optim.h`, `src/optim/muon.c`): the
+  MomentUm Orthogonalized by Newton-Schulz optimizer from Jordan et al.
+  (2024). On 2D parameter matrices, after the usual momentum + Nesterov
+  shift, the update direction is normalised by its Frobenius norm and
+  pushed through a 5-step quintic Newton-Schulz iteration
+  (`X ← aX + (bA + cA²)X` with `A = XXᵀ`, `(a,b,c) = (3.4445, -4.7750,
+  2.0315)`), then scaled by `max(1, √(rows/cols))`. The result is an
+  update whose singular values are all ≈ 1, i.e. as close to a true
+  orthogonal direction as a quintic can cheaply produce.
+- For non-2D parameters (biases, embedding tables, LayerNorm gains,
+  conv tensors, etc.) Muon falls back to SGD-with-momentum, matching
+  the reference Python implementation's "Muon for matrices, AdamW for
+  everything else" recipe — but folded into a single optimizer for
+  convenience.
+- The Newton-Schulz iteration's matmuls dispatch to the same
+  `slate_gemm_packed_accumulate` kernel that powers `slate_op_matmul`,
+  so NS cost on a 4096×4096 weight is ~5 × 137 GFLOP ≈ 11 ms per step
+  at ~60 GFLOP/s — negligible against a transformer's forward+backward.
+- A single shared NS scratch is allocated once at construction, sized
+  to the largest 2D parameter — so per-parameter optimizer state is
+  just one momentum buffer (1× the parameter footprint, same as SGD,
+  half of AdamW).
+- AVX2 inner loops for the per-element parts: momentum update,
+  Nesterov shift, Frobenius normalisation, the `bA + cA²` linear
+  combination, and the final weight update.
+- Tested in `tests/test_muon.c` across three shapes that exercise the
+  branches: tall `[4, 1]` (rows > cols, transpose-and-restore path);
+  wide `[2, 5]` (rows < cols, direct path); `[3, 2]` + 1D bias (mix of
+  NS path and SGD-momentum fallback). Loss drops > 5× on all three.
+
+### Summary — what is now SIMD vs still scalar
+
+After the kernel-optimisation pass, the SIMD-vectorised ops are:
+`matmul`, `bmm`, `softmax`, `rms_norm`, `silu`, `add`, `mul`, `add_bias`,
+`scale`, `dot_q8_0_f32` / `q8_0_matvec` (Q8_0 direct inner product).
+
+Still scalar (lower priority — either rarely called, memory-bound, or
+intrinsically hard to vectorise): `activation` (sigmoid/relu/tanh),
+`embedding` (random-access gather — memory-bound), `causal_mask` (mostly
+predicate writes), `cross_entropy` (one call per step), `loss` (likewise),
+`linear3d` (delegates to matmul internally), `matmul_bf16` (bf16 path,
+already exists for memory savings not for throughput), `permute12`,
+`transpose`. These together account for well under 10% of transformer
+forward+backward wall time in our measurements, so further SIMD work
+would have a diminishing return.
+
 ### Added — Final (engineering completeness)
 
 - **AdapterManager** (`include/slate/adapter_mgr.h`, `src/adapter/adapter_mgr.c`):

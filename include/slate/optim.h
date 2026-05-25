@@ -65,6 +65,26 @@ slate_optimizer_t* slate_optimizer_adamw_new(slate_arena_t* state_arena,
                                               float eps,
                                               float weight_decay);
 
+// =============================================================================
+// Muon: MomentUm Orthogonalized by Newton-Schulz (Jordan et al., 2024).
+// =============================================================================
+//
+// For each 2D parameter matrix, maintains a momentum buffer, applies a
+// Nesterov shift, orthogonalises the update direction via a 5-step
+// quintic Newton-Schulz iteration, then scales by max(1, sqrt(rows/cols))
+// before stepping.  For non-2D parameters (biases, embeddings, 3D+
+// tensors) it falls back to SGD-with-momentum.
+//
+// Recommended hyperparameters: lr ~ 0.02 (10x larger than AdamW),
+// momentum = 0.95, weight_decay = 0.0 or small, ns_steps = 5.  Pass
+// ns_steps = 0 to use the default (5).
+slate_optimizer_t* slate_optimizer_muon_new(slate_arena_t* state_arena,
+                                             slate_param_set_t* params,
+                                             float learning_rate,
+                                             float momentum,
+                                             float weight_decay,
+                                             int   ns_steps);
+
 #ifdef __cplusplus
 }
 #endif

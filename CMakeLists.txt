@@ -125,6 +125,7 @@ add_library(slate STATIC
     src/tokenizer/bpe.c
     src/data/mmap_dataset.c
     src/optim/adafactor.c
+    src/optim/muon.c
 )
 
 target_include_directories(slate

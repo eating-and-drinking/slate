@@ -9,6 +9,19 @@ set(SLATE_TESTS
     test_sampling
     test_bpe
     test_mmap_adafactor
+    test_gguf
+    test_quant
+    test_gguf_q8_matmul
+    test_q8_dot
+    test_dpo
+    test_kto_kd
+    test_grpo
+    test_sandbox
+    test_checkpoint
+    test_bf16_mode
+    test_adapter_cache
+    test_prm_http
+    test_muon
 )
 foreach(t ${SLATE_TESTS})
     add_executable(slate_${t} ${t}.c)
