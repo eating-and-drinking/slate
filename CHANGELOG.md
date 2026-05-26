@@ -177,6 +177,48 @@ differences, `test_transformer_block` exercises SiLU + add + add_bias +
 scale + RMSNorm end-to-end), and the Final-assembly capstone is still
 byte-identical.
 
+### Added — On-Policy Distillation (OPD)
+
+- **`slate_op_kd_loss_topk`** (`include/slate/kd.h`, `src/objective/kd.c`):
+  KL teacher→student loss where the teacher distribution is given only on
+  its top-K vocab indices per position, with everything else treated as
+  zero support. Gradient comes out to `T·(Q_v − P̃_v) / (B·T)` per slot
+  with `P̃` the sparse (top-K only) teacher distribution — identical
+  shape to the dense `slate_op_kd_loss` backward, just with a sparse
+  subtraction. Saves ~2× memory over the dense variant for K << V and
+  matches the shape of remote teacher payloads (HTTP, mmap'd cache).
+- **`slate_topk_extract`** (`include/slate/opd.h`, `src/objective/opd.c`):
+  one-shot O(V·K) per-position top-K extraction over a `[B, T, V]`
+  logits buffer. Used to build the inputs to `kd_loss_topk` from a
+  teacher forward pass.
+- **OPD training recipe**: documented in `include/slate/opd.h` and
+  exercised end-to-end in `tests/test_opd.c` and `examples/10_opd/`.
+  Pipeline per step:
+  1. Run the student in eval-mode on the current sequence; sample the
+     next token via `slate_sample_token`; append; repeat.
+  2. Re-run the student on the full rollout with `training=true`; the
+     output logits have `requires_grad`.
+  3. Run the (frozen) teacher on the same rollout — since teacher
+     parameters are not in the optimizer's param set, no update flows
+     back to them.
+  4. `slate_topk_extract` on teacher logits → `[B, T, K]` indices +
+     logits tensors.
+  5. `slate_op_kd_loss_topk` → backward → optimizer step.
+  Same code structure works with the embedding-style "Markov LM" used
+  in the demo and with `slate_module_causal_lm` transformers (just
+  swap the forward call). Pairs naturally with Muon for matrix weights
+  + AdamW (or Muon's SGD-momentum fallback) for biases/embeddings.
+- **Test (`test_opd`)**: synthetic peaky teacher in `[V, V]` form;
+  student starts uniform; after 250 OPD steps, fixed-eval argmax
+  agreement reaches V/V (8/8), KD loss drops > 30×.
+- **Example (`examples/10_opd/`)**: same Markov-style teacher with
+  V=16, K=4. Trains in ~3 s and shows eval-KL dropping 3× while
+  argmax-agree goes from 1/16 to 16/16. The example prints the
+  rollout-loss vs the fixed-eval KL side-by-side and explains in a
+  comment why on-policy rollout-loss is *not* monotone (the basis
+  itself moves between steps) and the fixed-eval metric is what to
+  watch for convergence.
+
 ### Added — Muon optimizer (Newton-Schulz orthogonalised momentum)
 
 - **Muon** (`include/slate/optim.h`, `src/optim/muon.c`): the

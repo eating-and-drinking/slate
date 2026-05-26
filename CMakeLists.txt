@@ -126,6 +126,7 @@ add_library(slate STATIC
     src/data/mmap_dataset.c
     src/optim/adafactor.c
     src/optim/muon.c
+    src/objective/opd.c
 )
 
 target_include_directories(slate

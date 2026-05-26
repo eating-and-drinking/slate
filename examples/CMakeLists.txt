@@ -15,3 +15,6 @@ target_link_libraries(slate_tinyshakespeare PRIVATE slate)
 
 add_executable(slate_gpt2 04_gpt2/main.c)
 target_link_libraries(slate_gpt2 PRIVATE slate)
+
+add_executable(slate_opd 10_opd/main.c)
+target_link_libraries(slate_opd PRIVATE slate)

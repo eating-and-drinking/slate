@@ -22,6 +22,7 @@ set(SLATE_TESTS
     test_adapter_cache
     test_prm_http
     test_muon
+    test_opd
 )
 foreach(t ${SLATE_TESTS})
     add_executable(slate_${t} ${t}.c)

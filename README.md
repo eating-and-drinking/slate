@@ -237,6 +237,7 @@ checkout or requires the user to supply data first.
 | `07_quantized_lora`           | M5 Q8\_0 base + LoRA, on-disk file unchanged        | no           |
 | `08_code_rl`                  | M7 GRPO + sandbox + reward, toy code RL loop        | no           |
 | `09_final_assembly`           | Capstone: GGUF → Q8\_0 → LoRA → ckpt → AdapterMgr   | no           |
+| `10_opd`                      | On-Policy Distillation: sample-then-KD with top-K   | no           |
 
 To run every operator's analytic backward against finite differences:
 
@@ -248,7 +249,8 @@ The full test suite includes `test_threadpool`, `test_mha`, `test_sampling`,
 `test_bpe`, `test_mmap_adafactor`, `test_gguf`, `test_quant`,
 `test_gguf_q8_matmul`, `test_dpo`, `test_kto_kd`, `test_grpo`,
 `test_sandbox`, `test_checkpoint`, `test_bf16_mode`, `test_adapter_cache`,
-and `test_prm_http`. Run them all with `ctest --test-dir build`.
+`test_prm_http`, `test_muon`, and `test_opd`. Run them all with
+`ctest --test-dir build`.
 
 ## Contributing
 
