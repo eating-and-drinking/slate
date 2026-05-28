@@ -329,39 +329,3 @@ slate_tensor_t* slate_op_matmul(slate_graph_ctx_t* ctx,
     }
     return out;
 }
- 16);
-    }
-    return out;
-}
-b = (float*)b->grad;
-            const float* pa = (const float*)a->data;
-            for (int64_t k = 0; k < K; ++k)
-                for (int64_t j = 0; j < N; ++j) {
-                    float acc = 0;
-                    for (int64_t i = 0; i < M; ++i) acc += pa[i * K + k] * d_out[i * N + j];
-                    db[k * N + j] += acc;
-                }
-        }
-    }
-}
-
-slate_tensor_t* slate_op_matmul(slate_graph_ctx_t* ctx,
-                                slate_tensor_t* a, slate_tensor_t* b) {
-    if (!ctx || !a || !b) return NULL;
-    if (a->dtype != SLATE_DTYPE_F32 || b->dtype != SLATE_DTYPE_F32) return NULL;
-    if (a->n_dims != 2 || b->n_dims != 2) return NULL;
-    if (a->shape[1] != b->shape[0]) return NULL;
-    int64_t M = a->shape[0], K = a->shape[1], N = b->shape[1];
-    int64_t os[2] = {M, N};
-    slate_tensor_t* out = slate_tensor_new(ctx->scratch_arena, SLATE_DTYPE_F32, 2, os, false);
-    if (!out) return NULL;
-    matmul_f32_threaded((float*)out->data, (const float*)a->data,
-                        (const float*)b->data, M, K, N);
-    slate_tensor_t* inputs[2] = {a, b};
-    slate_graph_node_t* node = slate_graph_record(ctx, "matmul", inputs, 2, out, matmul_backward);
-    if (node && out->requires_grad && !out->grad) {
-        out->grad = slate_arena_alloc(ctx->scratch_arena,
-                                       (size_t)slate_tensor_numel(out) * sizeof(float), 16);
-    }
-    return out;
-}

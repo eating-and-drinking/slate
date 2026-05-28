@@ -105,6 +105,9 @@ add_library(slate STATIC
     src/ops/causal_mask.c
     src/ops/linear3d.c
     src/ops/permute12.c
+    src/ops/rope.c
+    src/loader/llama.c
+    src/loader/llama_infer.c
     src/module/module.c
     src/module/linear.c
     src/module/sequential.c
@@ -127,7 +130,18 @@ add_library(slate STATIC
     src/optim/adafactor.c
     src/optim/muon.c
     src/objective/opd.c
+    src/infer/engine.c
+    src/server/metrics.c
+    src/server/jlog.c
+    src/server/http.c
+    src/server/apikey.c
+    src/server/scheduler.c
+    src/backend/backend_cpu.c
+    src/backend/backend_cuda_stub.c
+    src/backend/backend_metal_stub.c
 )
+
+target_compile_definitions(slate PRIVATE _GNU_SOURCE)
 
 target_include_directories(slate
     PUBLIC

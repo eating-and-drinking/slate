@@ -18,3 +18,6 @@ target_link_libraries(slate_gpt2 PRIVATE slate)
 
 add_executable(slate_opd 10_opd/main.c)
 target_link_libraries(slate_opd PRIVATE slate)
+
+add_executable(slate_inference_server 11_inference_server/main.c)
+target_link_libraries(slate_inference_server PRIVATE slate)

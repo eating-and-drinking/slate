@@ -39,6 +39,7 @@ const char* slate_dtype_name(slate_dtype_t dt) {
         case SLATE_DTYPE_I8:   return "i8";
         case SLATE_DTYPE_Q8_0: return "q8_0";
         case SLATE_DTYPE_Q4_0: return "q4_0";
+        case SLATE_DTYPE_Q4_K: return "q4_k";
         default:               return "?";
     }
 }
@@ -54,6 +55,7 @@ size_t slate_dtype_size(slate_dtype_t dt) {
         // placeholders so the table is complete; do not rely on them.
         case SLATE_DTYPE_Q8_0: return 34;   // 32 elements + scale
         case SLATE_DTYPE_Q4_0: return 18;   // 32 4-bit nibbles + scale
+        case SLATE_DTYPE_Q4_K: return 144;  // super-block of 256 -> 144 bytes
         default:               return 0;
     }
 }
@@ -63,7 +65,7 @@ bool slate_dtype_is_float(slate_dtype_t dt) {
 }
 
 bool slate_dtype_is_quantized(slate_dtype_t dt) {
-    return dt == SLATE_DTYPE_Q8_0 || dt == SLATE_DTYPE_Q4_0;
+    return dt == SLATE_DTYPE_Q8_0 || dt == SLATE_DTYPE_Q4_0 || dt == SLATE_DTYPE_Q4_K;
 }
 
 // =============================================================================
@@ -86,8 +88,5 @@ slate_status_t slate_set_error(slate_status_t status, const char* fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(g_last_error, sizeof(g_last_error), fmt, ap);
     va_end(ap);
-    return status;
-}
-(ap);
     return status;
 }

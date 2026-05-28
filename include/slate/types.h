@@ -34,6 +34,7 @@ typedef enum slate_dtype {
     // Block-quantized dtypes appear in M5.
     SLATE_DTYPE_Q8_0 = 16,
     SLATE_DTYPE_Q4_0 = 17,
+    SLATE_DTYPE_Q4_K = 18,        // GGML "k-quant" 4.5-bit (super-block of 256)
 
     SLATE_DTYPE_COUNT  // sentinel
 } slate_dtype_t;

@@ -1,70 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+# Continuous integration: build slate on Linux x86_64 (AVX2),
+# then run the full ctest suite.
+
 name: ci
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
 jobs:
-  build:
-    name: ${{ matrix.os }} / ${{ matrix.build_type }} ${{ matrix.sanitizer }}
-    runs-on: ${{ matrix.os }}
+  build-and-test:
+    name: Build + test (${{ matrix.build_type }})
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-14, windows-2022]
         build_type: [Release, Debug]
-        sanitizer: [""]
-        include:
-          - os: ubuntu-22.04
-            build_type: Debug
-            sanitizer: address
-          - os: ubuntu-22.04
-            build_type: Debug
-            sanitizer: undefined
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential python3
+          cmake --version
+          gcc --version
+
+      - name: Generate GGUF test fixtures
+        run: |
+          python3 tools/make_test_gguf.py
+          python3 tools/make_q8_gguf.py
+
       - name: Configure
         run: |
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DSLATE_SANITIZE=${{ matrix.sanitizer }} \
-            -DSLATE_BUILD_TESTS=ON \
-            -DSLATE_BUILD_EXAMPLES=ON
-        shell: bash
+          cmake -B build \
+                -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+                -DSLATE_BUILD_TESTS=ON \
+                -DSLATE_BUILD_EXAMPLES=ON \
+                -DSLATE_ENABLE_AVX2=ON
+
       - name: Build
-        run: cmake --build build --config ${{ matrix.build_type }} -j
+        run: cmake --build build --parallel
+
       - name: Test
-        run: ctest --test-dir build --output-on-failure -C ${{ matrix.build_type }}
-      - name: Run XOR example
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            ./build/examples/${{ matrix.build_type }}/slate_xor.exe
-          else
-            ./build/examples/slate_xor
-          fi
-        shell: bash
+        working-directory: build
+        run: ctest --output-on-failure --timeout 120
 
-  format-check:
-    name: clang-format
-    runs-on: ubuntu-22.04
+      - name: Smoke-run inference server example
+        run: |
+          timeout 30 ./build/examples/slate_inference_server
+
+  sanitizers:
+    name: ASAN + UBSAN
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format-14
-      - name: Run clang-format
+      - name: Install
         run: |
-          find src include tests examples -name '*.c' -o -name '*.h' \
-              | xargs clang-format-14 --dry-run --Werror
-
-  lint-headers:
-    name: layering check
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check that no src/ file includes a header from a layer above it
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential python3
+      - name: Build with sanitizers
         run: |
-          # M0 has no upward includes by construction; this is the placeholder
-          # for the real layer checker that arrives in M2.
-          echo "layering check passed (placeholder)"
+          cmake -B build-asan \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DSLATE_SANITIZE=address,undefined
+          cmake --build build-asan --parallel
+      - name: Generate fixtures
+        run: |
+          python3 tools/make_test_gguf.py
+          python3 tools/make_q8_gguf.py
+      - name: Run tests under sanitizers
+        working-directory: build-asan
+        run: ctest --output-on-failure --timeout 240

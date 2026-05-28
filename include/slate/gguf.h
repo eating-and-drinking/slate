@@ -42,6 +42,12 @@ slate_tensor_t* slate_gguf_get_tensor(slate_arena_t* meta_arena,
 // Diagnostic: print the metadata table to stdout.
 void slate_gguf_dump(const slate_gguf_t* g);
 
+// Metadata KV access.  Returns 0 on success, < 0 if the key is missing
+// or the value's type doesn't match.
+int slate_gguf_get_u32(const slate_gguf_t* g, const char* key, uint32_t* out);
+int slate_gguf_get_f32(const slate_gguf_t* g, const char* key, float* out);
+int slate_gguf_get_str(const slate_gguf_t* g, const char* key, const char** out);
+
 #ifdef __cplusplus
 }
 #endif

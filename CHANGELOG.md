@@ -7,6 +7,635 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Grouped-Query Attention (GQA) (`L9.6`)
+
+slate's LLaMA inference path now supports GQA — fewer K/V heads than
+Q heads.  Required by **LLaMA-3-8B** (32 Q / 8 K/V), **LLaMA-3-70B**
+(64/8), **Mistral-7B** (32/8), and every modern model larger than
+LLaMA-2-7B.  MHA continues to work as the trivial case (`group=1`).
+
+- **`attention_multihead`** (`src/loader/llama_infer.c`) generalised:
+  each Q head `hq` reads from K/V head `hq / group`, where `group =
+  n_q_heads / n_kv_heads`.  KV cache shape is already correctly sized
+  `[L, n_kv_heads * head_dim]` (the L9.3 loader read `n_kv_heads`
+  from `llama.attention.head_count_kv` metadata, so this just needed
+  the attention loop to honour it).
+
+- **MHA bit-identical**: existing `test_llama_infer` still passes
+  with `L_inf = 5.215e-8` (same as before this milestone).  GQA when
+  `n_kv_heads == n_heads` is the same code path as MHA.
+
+- **`tools/make_tiny_llama_gqa_gguf.py`**: synthetic GQA-shaped
+  LLaMA GGUF — `n_q_heads = 8`, `n_kv_heads = 2` (`group = 4`,
+  matching LLaMA-3-8B's pattern).  Reference numpy forward implements
+  the same grouped attention.
+
+- **Test** (`tests/test_llama_infer_gqa.c`): verifies slate's GQA
+  forward matches the numpy reference at **L_inf = 8.94e-8,
+  L2 = 3.11e-7** — bit-precise within fp32.
+
+- **`ROADMAP_LLAMA.md`** updated: item 3 (GQA) crossed off.  The
+  last remaining items are:
+    - SentencePiece tokenizer (or cheat mode for benchmarks)
+    - Multi-thread Q4_K matvec (performance, not correctness)
+    - Flash Attention 2 (performance)
+
+Total test count: 33/33 passing.
+
+### Added — Q4_K LLaMA inference (`L9.5`)
+
+slate's LLaMA inference now consumes **Q4_K_M quantised weights**
+directly — no f32 materialisation, no dequant-then-matmul round trip.
+This is the configuration real `llama-7b-Q4_K_M.gguf` files ship in
+(3.8 GB for a 7B model vs 26 GB for f32), and the one needed for
+slate to actually serve those models on commodity hardware.
+
+- **`slate_backend_t::matvec_q4k`** (`include/slate/backend.h`,
+  `src/backend/backend_cpu.c`): new primitive,
+  `void matvec_q4k(y, A_Q4K, x, M, K)`.  CPU backend wraps the
+  existing `slate_q4_k_matvec` (10.59 GFLOP/s on AVX2). CUDA/Metal
+  stubs left as NULL with documentation.
+
+- **`src/loader/llama_infer.c`**: per-weight dtype dispatch via a
+  small `mv_dispatch()` helper.  Each linear projection
+  (Wq, Wk, Wv, Wo, Wg, Wu, Wd, lm_head) picks `matvec_q4k` when the
+  loaded weight is `SLATE_DTYPE_Q4_K`, falls back to `matvec` when
+  it's `SLATE_DTYPE_F32`.  This means mixed-precision GGUFs (e.g.
+  Q4_K linear weights + f32 norms + f32 embedding) work transparently.
+
+- **`tools/make_tiny_llama_q4k_gguf.py`**: emits a synthetic LLaMA
+  GGUF where every projection weight is Q4_K_M (norms and embedding
+  stay f32 — matches real `llama-7b-Q4_K_M.gguf` layout).  Model
+  dims chosen so every K is a multiple of 256: V=64, D=256,
+  n_heads=4, head_dim=64, FFN=512.  875 KB, 21 tensors, 11 KV
+  metadata.
+
+- **Test** (`tests/test_llama_infer_q4k.c`): opens the Q4_K GGUF,
+  verifies `attn_q_dtype == ffn_gate_dtype == 18` (Q4_K), runs
+  prefill on a 5-token prompt, compares to numpy reference that
+  uses the *dequantised* weights. **Linf = 4.17e-7, L2 = 1.43e-6** —
+  bit-precise within fp32 (the Q4_K accumulation error is below
+  fp32's mantissa resolution at this model size).
+
+- **`ROADMAP_LLAMA.md`** updated: the remaining gap to a real
+  `llama-7b-Q4_K_M.gguf` is now:
+  1. Accept int32 prompts directly (cheat mode, ~30 lines) — needed
+     to bypass tokenization until SentencePiece lands
+  2. Larger `max_seq` (config-only, no code)
+  3. GQA for ≥13B class — slate-7B works as-is with MHA
+  4. Optionally multi-thread Q4_K matvec for higher tok/s
+
+Total test count: 32/32 passing.
+
+### Added — LLaMA inference path (`L9.4`)
+
+slate can now actually run a LLaMA-architecture model from a GGUF file.
+This closes the gap to "load real LLaMA-7B-Q4_K_M.gguf and stream
+tokens out" (modulo Q4_K weight unpacking inside matvec + a
+tokenizer, both of which are downstream of this).
+
+- **`include/slate/llama.h` (extended)** + **`src/loader/llama_infer.c`**:
+  - `slate_llama_session_t` — per-conversation state (per-layer KV
+    caches + position + scratch), allocated from the model's vocab/D/
+    n_heads/ffn config.
+  - `slate_llama_prefill(sess, tokens, n, out_logits)` — N successive
+    decode steps; returns last-position logits.
+  - `slate_llama_decode_step(sess, token, out_logits)` — single
+    decode advance; appends K/V into cache, returns logits.
+  - Architecture: multi-head causal self-attention with **RoPE
+    applied to Q and K post-projection** (per llama.cpp), SwiGLU FFN,
+    RMSNorm pre-attn + pre-FFN, optional tied output projection.
+  - MHA only for now (n_kv_heads must equal n_heads). GQA shape is
+    plumbed through the layer struct but the attention loop assumes
+    MHA — GQA generalisation is roadmap'd separately (~150 lines
+    diff).
+
+- **Bug fix (loader convention)**: `tools/make_tiny_llama_gguf.py`
+  and `tools/make_llama_ref.py` were originally using numpy
+  `[in, out]` shape for linear weights. The real llama.cpp GGUF
+  convention is **`[out, in]`** (output rows first; matvec consumes
+  the input vector). Both files were corrected, and `decode_one`
+  in `llama_infer.c` now uses `backend->matvec(y, W, x, M=out, K=in)`
+  instead of `linear_batch` for all linear projections. Without
+  this, slate's output drifts ~0.4 Linf from the reference; with it,
+  drift is `5.2e-8` (fp32 precision floor).
+
+- **Test** (`tests/test_llama_infer.c`): opens the synthetic
+  LLaMA GGUF, loads + sessions, runs prefill on a 5-token prompt,
+  compares last-position logits to the numpy reference dumped by
+  `tools/make_llama_ref.py`. **Linf = 5.215e-08, L2 = 1.649e-07** —
+  bit-precise within fp32.
+
+- **`ROADMAP_LLAMA.md`** updated: items 1 (RoPE), 2 (weight-name
+  mapping), and now the "actually run it" milestone are crossed
+  off. The remaining gaps to a real `llama-7b-Q4_K_M.gguf` are:
+    - Q4_K matvec in the backend (currently CPU backend's matvec is
+      f32-only; the Q4_K kernel exists in `quant.c` and just needs
+      backend hookup) — easy, ~50 lines
+    - SentencePiece tokenizer or cheat-mode int32 prompts — easy
+      if cheat mode (~30 lines)
+    - GQA for ≥13B-class models — medium (~150 lines)
+    - Multi-thread Q4_K matvec — performance, not correctness
+
+Total test count: 31/31 passing.
+
+### Added — LLaMA-format GGUF loader (`L9.3`)
+
+slate can now open a llama.cpp-format GGUF file and resolve its
+weight tensors + hyperparameters via the standard naming convention.
+Real LLaMA-2 / LLaMA-3 / Mistral / Qwen GGUF files share the same
+schema so this is the foundation for actually running those models.
+
+- **`include/slate/llama.h`** + **`src/loader/llama.c`**: parses the
+  `llama.*` kv metadata namespace (block_count, embedding_length,
+  feed_forward_length, attention.head_count, attention.head_count_kv
+  with MHA fallback, context_length, vocab_size, rope.freq_base,
+  attention.layer_norm_rms_epsilon).  Resolves the standard
+  per-block tensor names (`blk.N.attn_q.weight`, etc.) and the
+  global tensors (`token_embd.weight`, `output_norm.weight`,
+  `output.weight`).  Auto-detects tied output projection (when
+  `output.weight` is absent, aliases to `token_embd.weight`).
+
+- **GGUF reader extension** (`src/loader/gguf.c`): KV metadata is now
+  retained (not just `general.alignment`) and exposed via three
+  accessors: `slate_gguf_get_u32`, `slate_gguf_get_f32`,
+  `slate_gguf_get_str`.  This unlocks any future model-format wrapper
+  that needs to read GGUF metadata.
+
+- **`tools/make_tiny_llama_gguf.py`**: emits a 100 KB synthetic
+  LLaMA-format GGUF (V=64, D=32, n_layers=2, n_heads=2, head_dim=16,
+  FFN=64) with all 21 named tensors and 11 kv metadata entries.  CI
+  regenerates before running tests.
+
+- **Test** (`tests/test_llama_load.c`): opens the synthetic fixture,
+  verifies every config field matches what Python emitted, every
+  global + per-block tensor pointer is non-NULL, dtype is f32 (the
+  fixture is f32-only), and tied-output detection reports the
+  expected state.
+
+- **`ROADMAP_LLAMA.md`**: item 2 (GGUF→slate weight-name mapping)
+  crossed off. Items 3 (GQA), 4 (tokenizer), 5 (tied output —
+  partially done, the loader detects it; the inference path needs
+  to honour the flag), 6 (multi-thread Q4_K), 7 (Flash Attention)
+  remain.
+
+Total test count: 30/30 passing.
+
+### Added — Rotary Position Embedding (RoPE) (`L9.2`)
+
+The biggest blocker on the `ROADMAP_LLAMA.md` list — RoPE is what LLaMA
+uses instead of additive position embeddings, and you can't load any
+real LLaMA-2/3/Mistral/Qwen GGUF without it.
+
+- **`slate_op_rope(ctx, x, positions, theta_base)`**
+  (`include/slate/ops.h`, `src/ops/rope.c`):
+  - Input: `x` of shape `[B, T, n_heads, head_dim]` (head_dim must be even)
+  - Input: `positions` of shape `[T]` (i32) — per-token position
+  - `theta_base` = 10000.0 for LLaMA
+  - Standard GGML "non-interleaved" convention: rotates the first
+    and second halves of head_dim, so
+    ```
+    y[..., i]        = x[..., i] * cos(angle) - x[..., i + hd/2] * sin(angle)
+    y[..., i + hd/2] = x[..., i] * sin(angle) + x[..., i + hd/2] * cos(angle)
+    ```
+    where `angle = position * theta_base^(-2i/hd)` for `i in [0, hd/2)`.
+  - Full autograd backward (rotation by `-angle`).
+- **Tested against Python reference** (`tools/make_rope_ref.py`,
+  `tests/test_rope.c`):
+  - Forward matches numpy reference at `L_inf = 2.4e-7` (fp32 precision floor)
+  - Inverse round-trip `rope(rope(x, +pos), -pos) ≈ x` at `L_inf = 4.8e-7`
+- **`ROADMAP_LLAMA.md`** updated: item 1 (RoPE) crossed off. Items
+  2–7 (GGUF weight-name mapping, GQA, tokenizer, tied output,
+  multi-thread Q4_K matvec, Flash Attention) remain.
+
+Total test count: 29/29 passing.
+
+### Refactored — inference engine routes through `slate_backend_t` (`L9.1`)
+
+The L9.0 backend abstraction was a vtable nobody called.  This milestone
+wires `slate_infer_engine_t` to dispatch every compute primitive
+(matvec / linear_batch / rmsnorm_row / silu_mul / add_inplace /
+embed_lookup / attention_step) through the backend's vtable, and
+allocates session-side scratch (KV cache + activations) via
+`backend->alloc` / `backend->release`.
+
+After this milestone, retargeting slate to a real GPU is just:
+
+```
+slate_module_t* model = ...;
+const slate_backend_t* gpu = slate_backend_cuda();  // user fills this in
+slate_infer_engine_t* eng = slate_infer_engine_new_ex(
+    model, n_layers, d_model, vocab, ffn_hidden, max_seq, gpu);
+// Everything else (sessions, prefill, decode_step, batch_step,
+// scheduler, HTTP server) just works.
+```
+
+Backward-compat: `slate_infer_engine_new` (the legacy 6-arg constructor)
+is preserved — it now delegates to `_ex` with `backend=NULL` →
+`slate_backend_default()` → CPU.
+
+**Bit-identical correctness preserved**: `test_infer` still reports
+`L_inf = 0.000000` on prefill, decode_step, and batched output vs the
+training-side forward.  All 28/28 tests pass.
+
+Touched: `src/infer/engine.c` (~120 line diff), `include/slate/infer.h`
+(new `slate_infer_engine_new_ex` declaration + forward decl of
+`slate_backend`).  Nothing outside the engine needed to change — the
+inference server, scheduler, batched API, and quant codepaths all
+inherit the backend dispatch transparently.
+
+### Added — Compute-backend abstraction + CPU backend (`L9.0`)
+
+Lays the dispatch layer that lets the inference engine target GPUs
+later without re-architecting the engine.  This milestone delivers
+the abstraction + a fully-tested CPU backend; CUDA / Metal backends
+are explicit stubs.  Honesty: writing GPU kernels in a sandbox with
+no GPU hardware would ship "looks correct" code with bugs that don't
+surface until production.  Slate prefers the empty stub to that.
+
+- **`include/slate/backend.h`**: `slate_backend_t` — a vtable of 13
+  function pointers covering everything the inference fast-path
+  needs:
+    - memory: `alloc`, `release`, `copy_h2d`, `copy_d2h`;
+    - compute: `matvec`, `linear_batch`, `rmsnorm_row`, `silu_mul`,
+      `add_inplace`, `embed_lookup`, `attention_step`;
+    - sync: `sync`.
+- **`src/backend/backend_cpu.c`**: full CPU implementation wrapping
+  the existing AVX2 kernels + packed-panel GEMM.  64-byte aligned
+  `alloc`, trivial `copy`, all primitives match slate's existing
+  performance characteristics.
+- **`src/backend/backend_cuda_stub.c` + `backend_metal_stub.c`**:
+  explicit NULL-returning stubs.  Each carries a comment block
+  explaining the recommended implementation pathway (cuBLAS sgemm
+  for matvec/linear_batch, single-block reduction kernels for
+  RMSNorm/softmax, etc.) so a GPU engineer dropping in real kernels
+  has the contract spelled out.
+- **`docs/GPU_BACKEND.md`**: design notes + per-primitive
+  implementation table + the conformance contract (the test suite
+  the GPU kernels must pass) + suggested ordering of future work
+  (engine refactor → CUDA backend → multi-GPU sharding → Flash
+  Attention 2 → fp16 weights).
+- **`tests/test_backend.c`**: 8 conformance tests covering every
+  compute primitive against scalar reference.  Max measured drift
+  on CPU backend: `4.77e-7` (silu_mul, AVX2 sigmoid polynomial);
+  most primitives are `0.000000` or `< 1e-7`.
+
+After this milestone, retargeting slate to a real GPU is:
+  1. Refactor `src/infer/engine.c` to call through `slate_backend_t`
+     instead of its private static helpers (~150 lines diff, no
+     algorithmic change);
+  2. Write `backend_cuda.cu` (`backend_metal.m`) against the
+     test_backend conformance contract;
+  3. CMake conditional substitution wires the real backend in
+     place of the stub when `-DSLATE_ENABLE_CUDA=ON`.
+
+Total test count: 28/28 passing.
+
+### Added — GGUF Q4_K_M load path + honest LLaMA gap (`L8.7`)
+
+- **GGUF reader recognises Q4_K_M** (`src/loader/gguf.c`):
+  - `GGML_T_Q4_K = 12` tensor type
+  - `dtype_nbytes(Q4_K, n) = (n/256) * 144`
+  - maps to new `SLATE_DTYPE_Q4_K = 18`
+  - `slate_dtype_name` returns `"q4_k"`,
+    `slate_dtype_is_quantized` returns true
+- **Synthetic Q4_K_M GGUF fixture** (`tools/make_q4k_gguf.py`):
+  produces a 2.4 KB GGUF with one `weight` tensor of shape `[16, 256]`
+  (16 super-blocks of 256 = 4096 weights total) plus a sidecar
+  `slate_q4k_expected.f32` file containing the spec-compliant
+  reconstruction. CI regenerates both before running tests.
+- **End-to-end test** (`tests/test_gguf_q4k.c`):
+  - opens the GGUF via mmap;
+  - resolves the `weight` tensor via `slate_gguf_get_tensor`;
+  - verifies `dtype == SLATE_DTYPE_Q4_K`;
+  - runs `slate_dequant_q4_k` and asserts `L_inf = 0` vs the reference
+    reconstruction (bit-identical);
+  - runs `slate_dot_q4_k_f32` with a random `y` and compares to
+    double-precision `dequant·y` — rel_err 1.4e-7;
+  - runs `slate_q4_k_matvec` across all 16 rows and compares to
+    `dequant ⋅ x` row-by-row — rel L_inf 1.5e-6.
+- **`ROADMAP_LLAMA.md`**: written honestly. Lists the seven things
+  still missing for slate to load a real `llama-7b-Q4_K_M.gguf`:
+  1. RoPE (biggest blocker)
+  2. GGUF→slate weight-name mapping
+  3. GQA
+  4. SentencePiece tokenizer (or cheat mode for benchmarks)
+  5. Tied output projection
+  6. Multi-thread Q4_K matvec
+  7. Flash-Attention tiling
+  with effort estimates and the order I'd suggest tackling them.
+  Bottom line: 1.5–2 more focused sessions before the first real
+  LLaMA-7B token comes out of slate.
+
+Total test count: 27/27 passing.
+
+### Added — Q4_K_M quantized inference (`L8.5`)
+
+GGML's 4.5-bits/weight super-block format — the deployment-standard
+quant for LLaMA-7B class models on consumer hardware.  Adds dequant,
+fused inner-product, and matvec entry points alongside the existing
+Q8_0 family.
+
+- **Format**: 256-element super-block, 144 bytes per block.
+  - `f16 d` + `f16 dmin` super-block scales (4 bytes)
+  - 12-byte packed `(scale_j, min_j)` pairs for 8 sub-blocks of 32 weights
+    (6-bit unsigned each; standard GGML packing)
+  - 128 bytes of 4-bit quants (low nibble = first 16 weights, high = next 16)
+  - Reconstruction: `x_i = d · scale_j · q_i − dmin · min_j`
+
+- **`slate_dequant_q4_k`**: spec-conformant dequantizer.  Bit-identical
+  to the Python reference in `tools/make_q4k_test.py`
+  (verified `L_inf = 0.000000` in `test_q4k`).
+
+- **`slate_dot_q4_k_f32`**: fused Q4_K × f32 inner product using the
+  closed-form sub-block factorisation
+  ```
+  <x, y> = sum_j ( d·scale_j · sum_{i in j} q_i·y_i
+                 − dmin·min_j · sum_{i in j} y_i )
+  ```
+  so weights are never materialised as f32.  AVX2 path: load 16
+  nibble-bytes → unpack to 32 int8s → convert to f32 → FMA with y.
+  Verified within 1.5e-7 relative error vs dequant-then-dot.
+
+- **`slate_q4_k_matvec`**: per-row wrapper over the dot kernel, same
+  shape as `slate_q8_0_matvec` so calling code can swap quant formats.
+
+- **Benchmark** (`benchmarks/bench_q4k_vs_q8.c`), 4096×4096 matvec
+  (LLaMA-7B attention/FFN projection shape):
+
+  | format | memory      | latency      | GFLOP/s | vs f32 |
+  |--------|------------:|-------------:|--------:|-------:|
+  | f32    | **64.0 MB** | 18.40 ms     | 1.82    | 1.0×   |
+  | Q8_0   | 17.0 MB     | 3.55 ms      | 9.44    | 5.18×  |
+  | Q4_K_M | **9.0 MB**  | **3.17 ms**  | **10.59** | **5.81×** |
+
+  Memory **7× smaller than f32, 1.9× smaller than Q8_0** — matching
+  the spec ratio (8.25 vs 4.5 bits/weight).  After the AVX2 kernel
+  optimisation (see "Q4_K AVX2 kernel" below) Q4_K_M is now **1.12×
+  faster than Q8_0** on top of being half the memory: the smaller
+  weights save more L2 bandwidth than the extra sub-block bookkeeping
+  costs.  At LLaMA-7B model size (~6.5B params), f32 weighs ~26 GB;
+  in Q4_K_M it fits in **~3.8 GB** — runnable on a 4 GB Raspberry Pi 5.
+
+### Performance — Q4_K AVX2 kernel
+
+- The first-pass Q4_K dot kernel issued **16 `hsum256` calls per
+  super-block** (one for `qy` and one for `sy` in each of the 8
+  sub-blocks).  Horizontal SIMD reductions are expensive — they stall
+  on cross-lane shuffles.
+- Rewrote the inner loop to **defer the hsum to the super-block
+  boundary** (2 hsums per super-block instead of 16):
+  - Per sub-block: collapse the 4 partial `__m256` accumulators down
+    to a single `__m256` `qy_p` (and `sy_p`) using SIMD lane-wise
+    adds — no horizontal reduction.
+  - Broadcast the scalar `scale_j` / `min_j` into all 8 lanes and FMA
+    into super-block-wide `__m256` accumulators (`d_acc`, `m_acc`).
+  - After all 8 sub-blocks, hsum once per accumulator.
+- Result: **Q4_K_M dot throughput 6.42 → 10.59 GFLOP/s (1.65× faster)**.
+  Test_q4k still passes with `L_inf = 0.000000` vs the Python
+  reference and `rel_err = 7.97e-8` vs dequant-then-dot — i.e.
+  correctness preserved.
+
+- **Test** (`tests/test_q4k.c`): three-part conformance check:
+    1. Dequant matches Python reference bit-identically;
+    2. Dequant within 0.05 mean-abs error of the original f32 weights;
+    3. Direct dot matches dequant-then-dot within 1e-5 relative error.
+
+- **Fixture generator** (`tools/make_q4k_test.py`): produces the test
+  block + reference reconstruction from a known seed, so the test
+  fixture is reproducible and the CI can regenerate it.
+
+Total test count: 26/26 passing.
+
+### Added — Server-side batching scheduler (`L8.4`)
+
+Wires the L8.3 batched engine into the production HTTP server so end-to-end
+throughput improves under concurrent load, not just on synthetic benchmarks.
+
+- **`slate_scheduler_t`** (`include/slate/scheduler.h`,
+  `src/server/scheduler.c`): one dedicated decoder thread + a shared
+  pending-request queue. Workers call
+  `slate_scheduler_decode(scheduler, sess, token, out_logits)`,
+  which is synchronous from the worker's POV: it queues the request,
+  blocks on a per-request cond var, and returns when the decoder has
+  drained up to `max_batch` requests in one `slate_infer_batch_step`
+  call and filled `out_logits`. Workers can leave the loop between
+  tokens (max_tokens hit, EOS, etc.) without breaking the batch.
+  Atomic stats track total batches and average batch size for
+  observability.
+
+- **HTTP server integration** (`src/server/http.c`): when
+  `slate_server_config_t::scheduler_max_batch > 0` (default 16), the
+  decode loop in `handle_connection` routes through
+  `slate_scheduler_decode` instead of calling `slate_infer_decode_step`
+  directly. Per-session prefill stays on the worker (it's cheap, and
+  each session is independent). Streaming and non-streaming responses
+  both benefit. Same auth + rate-limit + metrics path.
+
+- **Benchmark** (`benchmarks/bench_server_load.c`): real HTTP load
+  test — spawns one slate server, then 8 client threads each making
+  4 sequential /v1/completions requests for 16 generated tokens each.
+  Measured (model V=4096 D=256 L=4 FFN=1024, AVX2 single-thread sandbox):
+
+  | scheduler | total tokens | wall time | tok/s    |
+  |-----------|-------------:|----------:|---------:|
+  | off       | 512          | 1.289 s   | **397**  |
+  | on (B=16) | 512          | 0.722 s   | **710**  |
+
+  **1.79× end-to-end** on real concurrent load. The headroom toward
+  the synthetic-benchmark 9.7× comes from:
+    1. prefill is still per-request (not yet batched);
+    2. 16-token generations are short — fixed per-request HTTP
+       overhead is a larger fraction than at production-grade 200+
+       token generations;
+    3. only 8 concurrent clients in this run — the scheduler's
+       max_batch is 16, so it's running at half capacity for this
+       configuration.
+
+### Added — Continuous batching (`L8.3`)
+
+Batched inference path for multiple concurrent sessions. The biggest
+single throughput win in the production stack — for small models the
+per-call overhead of the packed-panel GEMM dominates at M=1, and
+stacking sessions into a single M=B GEMM amortises that overhead
+nearly perfectly.
+
+- **`slate_infer_batch_t` + `slate_infer_batch_step`**
+  (`include/slate/infer.h`, `src/infer/engine.c`): pre-allocated
+  batch-wide scratch for B concurrent sessions. One call advances all
+  B by one token. The linear projections per layer (Wq, Wk, Wv, Wo,
+  Wg, Wu, Wd, lm_head) all run as M=B GEMMs; only the causal
+  attention stays per-session (each request has its own cache
+  length, which is exactly the *point* of continuous batching).
+  Sessions in a batch can be at *different* current positions — the
+  engine looks up `pos_emb[sess->position]` and runs full
+  cache-aware attention per session, so the scheduler can mix
+  long-context with fresh prompts in the same batch.
+
+- **Correctness contract**: `tests/test_infer.c` now includes a
+  batched-vs-sequential equivalence test. Same prompts, same
+  next-tokens; batched output's L_inf = 0.000000 vs sequential, i.e.
+  bit-identical. KV caches remain fully independent across sessions
+  — they are never aliased.
+
+- **Throughput measured** (`benchmarks/bench_batch_throughput.c`,
+  model: V=4096 D=256 L=4 FFN=1024, AVX2 single-thread sandbox):
+
+  | B  | sequential tok/s | batched tok/s | speedup |
+  |---:|-----------------:|--------------:|--------:|
+  |  1 |              320 |           318 |   1.00× |
+  |  2 |              325 |           623 |   1.95× |
+  |  4 |              328 |          1188 |   3.72× |
+  |  8 |              317 |          2215 |   6.93× |
+  | 16 |              319 |          3100 |   9.71× |
+
+  Sequential throughput stays flat at ~320 tok/s regardless of B
+  (confirming the M=1 GEMM overhead bottleneck); batched throughput
+  scales nearly linearly to ~3100 tok/s at B=16. That's the line
+  that takes slate from "demo" to "actually serve concurrent users
+  on one CPU".
+
+### Added — Production CPU inference server, round 2 (`L8.2`)
+
+Production-readiness pass on the inference server added in L8: streaming,
+multi-tenant auth, rate limiting, graceful shutdown, and CI.
+
+- **SSE token streaming on `/v1/completions`**: when the request body
+  carries `"stream": true`, the server switches from buffered JSON to
+  `Content-Type: text/event-stream` and emits one `data: {"token": N}`
+  event per generated token, followed by a `data: [DONE]` terminator.
+  Same compute path as the non-streaming case (one engine
+  `decode_step` per token) — the difference is whether the response
+  is collected before the headers are written. Compatible with the
+  OpenAI streaming protocol shape. Latency to first token is recorded
+  as a separate `slate_time_to_first_token_ms` histogram so an
+  operator can SLO on prompt-prefill cost independently of total
+  generation time.
+
+- **Multi-tenant auth + per-key rate limit** (`include/slate/apikey.h`,
+  `src/server/apikey.c`): `slate_apikey_set_t` holds N keys, each with
+  its own token-bucket (rps refill + burst capacity). Authentication
+  matches the `Authorization: Bearer ...` header against the set; on
+  match the bucket is decremented and the request proceeds. Empty
+  bucket → HTTP 429 with `slate_rate_limited_total` counter
+  incremented; not found → 401 as before. One mutex per key so
+  bursts on key A don't serialise against key B traffic. Schema +
+  loader for JSON config files so secrets aren't compiled in:
+  ```json
+  [
+    {"key": "...", "label": "free-tier",  "rps": 1.0, "burst": 5},
+    {"key": "...", "label": "paid-tier",  "rps": 0,   "burst": 0}
+  ]
+  ```
+  The single-key `api_key` field on the server config still works for
+  back-compat; if present (and `apikey_set` is NULL) it's wrapped in a
+  synthetic single-entry set with no rate limit.
+
+- **Graceful SIGINT / SIGTERM shutdown**:
+  `slate_server_install_signal_handler()` wires both signals to
+  `slate_server_stop()`. On stop: the accept loop exits, `/health`
+  starts answering 503 (so an upstream LB can pull the node out of
+  rotation), workers drain pending requests, and
+  `slate_server_free()` waits up to `shutdown_timeout_sec` for the
+  in-flight count to reach zero before joining workers. Hard timeout
+  forces termination and logs `shutdown_timeout` with the remaining
+  request count.
+
+- **More metrics**: `slate_rate_limited_total`,
+  `slate_stream_requests_total`, `slate_active_requests` (gauge — used
+  for the graceful drain), `slate_time_to_first_token_ms` histogram.
+  Request log records now include `key`, `stream`, and `ttft_ms`.
+
+- **Inference engine introspection**: added
+  `slate_infer_engine_vocab(eng)` and `slate_infer_engine_max_seq(eng)`
+  getters so callers can size logits buffers and clamp sampled token
+  ids to the actual vocab without having to thread those constants
+  through manually. Caught a real bug in the L8 server during
+  testing — without the getter, sampling against an oversized buffer
+  was returning out-of-vocab ids and `decode_step` was rejecting
+  them after the first token.
+
+- **GitHub Actions CI** (`.github/workflows/ci.yml`): builds slate on
+  Ubuntu latest with both Release and Debug; regenerates the GGUF
+  fixtures (`tools/make_test_gguf.py`, `tools/make_q8_gguf.py`);
+  runs the full ctest suite; runs the inference server example as a
+  real end-to-end smoke test. Separate ASAN/UBSAN job catches memory
+  / undefined-behaviour regressions on every push.
+
+- **Example updates**: `examples/11_inference_server` now demonstrates
+  all the new features end-to-end — registers two keys (one
+  rate-limited, one unlimited), hits both, triggers a 429 by exceeding
+  the rate-limited key's burst, hits the streaming endpoint and
+  parses the SSE events, hits `/health` again after a stop to see the
+  draining response.
+
+### Added — Production CPU inference server (`L8`)
+
+End-to-end serving stack: a model trained with slate goes through the
+new `slate_infer_engine_t` (KV-cached, no autograd graph), behind a
+hand-rolled HTTP/1.1 server with Prometheus metrics + structured JSON
+logging + bearer-token auth.
+
+- **`include/slate/infer.h` + `src/infer/engine.c`**:
+  inference-only forward path with a per-session KV cache. Single-step
+  decode is `O(L·D)` instead of the training forward's `O(L²·D)`, so
+  generation latency stays roughly linear past a long prompt. Same
+  packed-panel AVX2 GEMM as training; same RMSNorm / SwiGLU SIMD
+  helpers. Bypasses the autograd graph entirely — no node arenas, no
+  gradient buffers, no scratch tensors. Engine is read-only after
+  construction (shareable across threads); sessions are per-request.
+  Memory cost per session: `2 · n_layers · max_seq · D · 4 B`.
+  Bit-identical to the training-side forward — tested in `test_infer`
+  with `L_inf = 0` on both prefill and decode_step paths.
+
+- **`include/slate/server.h` + `src/server/http.c`**: minimal HTTP/1.1
+  server on raw BSD sockets (no libcurl / libmicrohttpd). Endpoints:
+  `POST /v1/completions` (JSON request: `prompt`, `max_tokens`,
+  `temperature`, `top_p`, `top_k`), `GET /health`, `GET /metrics`
+  (Prometheus exposition). One thread per connection from a fixed-size
+  worker pool; each worker holds its own `slate_infer_session_t` so KV
+  caches don't cross requests. `Authorization: Bearer <key>` when an
+  `api_key` is configured; bound to `INADDR_ANY` so a TLS-terminating
+  reverse proxy (nginx / Envoy / Caddy) can sit in front.
+
+- **`include/slate/metrics.h` + `src/server/metrics.c`**: Prometheus
+  counter / gauge / histogram. Atomic adds for thread safety, single
+  registry lock for the construction path. Exposition emits a stable
+  Prometheus text format consumable by the standard scrape pipeline.
+  Built-in server metrics: `slate_requests_total`,
+  `slate_tokens_in_total`, `slate_tokens_out_total`,
+  `slate_auth_failures_total`, `slate_errors_total`,
+  `slate_active_connections` (gauge), `slate_request_latency_ms`
+  (histogram, 14 buckets `1ms..8s`), `slate_tokens_out_hist`.
+
+- **`include/slate/jlog.h` + `src/server/jlog.c`**: structured (JSON)
+  one-line-per-record logger on stderr. Pluggable level filter,
+  pluggable output `FILE*`. Standard fields: `ts` (RFC3339 UTC),
+  `level`, `event`, `fields{}`. Designed to be ingested by
+  Loki / OpenSearch / Splunk without further parsing.
+
+- **`examples/11_inference_server/`**: end-to-end demo. Builds a tiny
+  random-weight transformer, wraps it in the engine, runs the server
+  on a background thread, then a built-in self-client hits `/health`,
+  `/v1/completions` both with and without auth, `/metrics`, and an
+  unknown URL — verifying status codes (200 / 401 / 200 / 404), JSON
+  payload shape, and the metrics output (`slate_requests_total`,
+  `slate_auth_failures_total` correctly incremented). Exits 0 on full
+  pass.
+
+- **`tests/test_infer.c`**: KV-cache correctness contract. Compares
+  the engine's prefill output against `slate_module_forward` on the
+  same prompt + last-position slice, then compares a single
+  `decode_step` after that prefill against a full re-forward on the
+  extended prompt. Both Linf differences must be < 1e-3 (actually
+  observed: 0.000000 on both, i.e. bit-identical).
+
+Open production gaps not yet addressed (see ROADMAP): continuous
+batching across concurrent requests, paged-attention style cache
+eviction for long conversations, Q4_K_M / Q5_K quantized inference,
+TLS termination in-process, structured rate-limiting per-key, model
+hot-reload, GPU back-end.
+
 ### Performance — packed-panel GEMM (kernel-layer rewrite)
 
 The forward and backward matmul were rewritten to GotoBLAS-style three-level

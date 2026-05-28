@@ -82,6 +82,20 @@ engineering completeness. The codebase is roughly **8.4k LOC** under `src/` and
 | M7        | GRPO (vanilla/Dr./DAPO), sandbox, code RL        | done\*   |
 | Final     | AdapterManager, TeacherCache, NEON, PRM, HTTP    | done     |
 | Perf      | Packed-panel GEMM, 8×8 AVX2 µkernel, TLS scratch | done     |
+| L8        | KV-cache inference + HTTP server + Prom metrics  | done     |
+| L8.2      | SSE streaming, multi-key auth, rate limit, CI    | done     |
+| L8.3      | Continuous batching (~10× tok/s at B=16)         | done     |
+| L8.4      | Server-side scheduler (1.79× end-to-end)         | done     |
+| L8.5      | Q4_K_M inference (7× smaller than f32)           | done     |
+| L8.6      | Q4_K AVX2 kernel: 10.59 GFLOP/s (beats Q8_0)     | done     |
+| L8.7      | GGUF Q4_K_M load path + ROADMAP_LLAMA.md         | done     |
+| L9.0      | Compute-backend abstraction + CPU backend        | done     |
+| L9.1      | Engine routes through backend vtable (GPU-ready) | done     |
+| L9.2      | RoPE op (clears LLaMA biggest blocker)           | done     |
+| L9.3      | LLaMA-format GGUF loader (slate_llama_t)         | done     |
+| L9.4      | LLaMA inference: prefill/decode bit-precise      | done     |
+| L9.5      | Q4_K LLaMA inference (matches numpy dequant ref) | done     |
+| L9.6      | GQA (LLaMA-3-8B/70B, Mistral-7B compatible)      | done     |
 
 `done*` means the implementation is complete and verified end-to-end in the
 sandbox on toy/synthetic inputs, but the *production* acceptance target
@@ -238,6 +252,7 @@ checkout or requires the user to supply data first.
 | `08_code_rl`                  | M7 GRPO + sandbox + reward, toy code RL loop        | no           |
 | `09_final_assembly`           | Capstone: GGUF → Q8\_0 → LoRA → ckpt → AdapterMgr   | no           |
 | `10_opd`                      | On-Policy Distillation: sample-then-KD with top-K   | no           |
+| `11_inference_server`         | HTTP server + KV cache + Prometheus + JSON logs     | no           |
 
 To run every operator's analytic backward against finite differences:
 
@@ -249,8 +264,8 @@ The full test suite includes `test_threadpool`, `test_mha`, `test_sampling`,
 `test_bpe`, `test_mmap_adafactor`, `test_gguf`, `test_quant`,
 `test_gguf_q8_matmul`, `test_dpo`, `test_kto_kd`, `test_grpo`,
 `test_sandbox`, `test_checkpoint`, `test_bf16_mode`, `test_adapter_cache`,
-`test_prm_http`, `test_muon`, and `test_opd`. Run them all with
-`ctest --test-dir build`.
+`test_prm_http`, `test_muon`, `test_opd`, and `test_infer`. Run them all
+with `ctest --test-dir build`.
 
 ## Contributing
 

@@ -23,6 +23,15 @@ set(SLATE_TESTS
     test_prm_http
     test_muon
     test_opd
+    test_infer
+    test_q4k
+    test_gguf_q4k
+    test_backend
+    test_rope
+    test_llama_load
+    test_llama_infer
+    test_llama_infer_q4k
+    test_llama_infer_gqa
 )
 foreach(t ${SLATE_TESTS})
     add_executable(slate_${t} ${t}.c)

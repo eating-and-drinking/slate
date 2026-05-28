@@ -24,7 +24,7 @@ enum {
 enum {
     GGML_T_F32=0, GGML_T_F16=1,
     GGML_T_Q4_0=2, GGML_T_Q4_1=3, GGML_T_Q5_0=6, GGML_T_Q5_1=7,
-    GGML_T_Q8_0=8, GGML_T_Q8_1=9,
+    GGML_T_Q8_0=8, GGML_T_Q8_1=9, GGML_T_Q4_K=12,
 };
 
 typedef struct {
@@ -36,6 +36,19 @@ typedef struct {
     size_t nbytes;
 } gguf_tinfo_t;
 
+typedef struct {
+    char* key;
+    uint32_t type;
+    union {
+        uint32_t u32;
+        int32_t  i32;
+        float    f32;
+        uint64_t u64;
+        int64_t  i64;
+        char*    str;
+    } v;
+} gguf_kv_t;
+
 struct slate_gguf {
     int fd;
     void* map;
@@ -44,6 +57,7 @@ struct slate_gguf {
     uint64_t n_kv;
     uint64_t alignment;
     gguf_tinfo_t* tinfos;
+    gguf_kv_t*    kvs;
     uint64_t data_offset;
 };
 
@@ -91,6 +105,7 @@ static size_t dtype_nbytes(int t, int64_t numel) {
     if (t == GGML_T_F16) return (size_t)numel * 2;
     if (t == GGML_T_Q8_0) return ((size_t)numel / 32) * 34;
     if (t == GGML_T_Q4_0) return ((size_t)numel / 32) * 18;
+    if (t == GGML_T_Q4_K) return ((size_t)numel / 256) * 144;
     return 0;
 }
 static slate_dtype_t map_dtype(int g) {
@@ -99,6 +114,7 @@ static slate_dtype_t map_dtype(int g) {
         case GGML_T_F16:  return SLATE_DTYPE_F16;
         case GGML_T_Q8_0: return SLATE_DTYPE_Q8_0;
         case GGML_T_Q4_0: return SLATE_DTYPE_Q4_0;
+        case GGML_T_Q4_K: return SLATE_DTYPE_Q4_K;
         default: return SLATE_DTYPE_F32;
     }
 }
@@ -117,13 +133,27 @@ slate_gguf_t* slate_gguf_open(const char* path) {
     if (cur_read(&c, &n_tensors, 8)) goto bad;
     if (cur_read(&c, &n_kv, 8)) goto bad;
     uint64_t alignment = GGUF_DEFAULT_ALIGN;
+    gguf_kv_t* kvs = (gguf_kv_t*)calloc((size_t)n_kv, sizeof(gguf_kv_t));
     for (uint64_t i = 0; i < n_kv; ++i) {
         char* k; if (cur_read_str(&c, &k)) goto bad;
         uint32_t vt; if (cur_read(&c, &vt, 4)) { free(k); goto bad; }
-        if (strcmp(k, "general.alignment") == 0 && vt == GGUF_T_U32) {
-            uint32_t a; cur_read(&c, &a, 4); alignment = a;
-        } else if (skip_value(&c, vt)) { free(k); goto bad; }
-        free(k);
+        kvs[i].key  = k;
+        kvs[i].type = vt;
+        if (vt == GGUF_T_U32) {
+            cur_read(&c, &kvs[i].v.u32, 4);
+            if (strcmp(k, "general.alignment") == 0) alignment = kvs[i].v.u32;
+        } else if (vt == GGUF_T_I32) {
+            cur_read(&c, &kvs[i].v.i32, 4);
+        } else if (vt == GGUF_T_F32) {
+            cur_read(&c, &kvs[i].v.f32, 4);
+        } else if (vt == GGUF_T_U64) {
+            cur_read(&c, &kvs[i].v.u64, 8);
+        } else if (vt == GGUF_T_I64) {
+            cur_read(&c, &kvs[i].v.i64, 8);
+        } else if (vt == GGUF_T_STRING) {
+            char* s; if (cur_read_str(&c, &s)) goto bad;
+            kvs[i].v.str = s;
+        } else if (skip_value(&c, vt)) goto bad;
     }
     gguf_tinfo_t* tinfos = (gguf_tinfo_t*)calloc((size_t)n_tensors, sizeof(*tinfos));
     for (uint64_t i = 0; i < n_tensors; ++i) {
@@ -147,7 +177,7 @@ slate_gguf_t* slate_gguf_open(const char* path) {
     size_t data_off = cur_off + pad;
     slate_gguf_t* g = (slate_gguf_t*)calloc(1, sizeof(*g));
     g->fd = fd; g->map = p; g->map_size = (size_t)st.st_size;
-    g->n_tensors = n_tensors; g->n_kv = n_kv;
+    g->n_tensors = n_tensors; g->n_kv = n_kv; g->kvs = kvs;
     g->alignment = alignment; g->tinfos = tinfos;
     g->data_offset = data_off;
     return g;
@@ -159,6 +189,13 @@ void slate_gguf_close(slate_gguf_t* g) {
     if (!g) return;
     for (uint64_t i = 0; i < g->n_tensors; ++i) free(g->tinfos[i].name);
     free(g->tinfos);
+    if (g->kvs) {
+        for (uint64_t i = 0; i < g->n_kv; ++i) {
+            free(g->kvs[i].key);
+            if (g->kvs[i].type == GGUF_T_STRING) free(g->kvs[i].v.str);
+        }
+        free(g->kvs);
+    }
     munmap(g->map, g->map_size); close(g->fd); free(g);
 }
 int slate_gguf_n_tensors(const slate_gguf_t* g) { return g ? (int)g->n_tensors : 0; }
@@ -197,4 +234,38 @@ void slate_gguf_dump(const slate_gguf_t* g) {
                (unsigned long long)t->offset, t->nbytes, t->name);
     }
     if (g->n_tensors > 20) printf("  ... (+%d)\n", (int)g->n_tensors - 20);
+}
+
+
+static const gguf_kv_t* find_kv(const slate_gguf_t* g, const char* key) {
+    for (uint64_t i = 0; i < g->n_kv; ++i) {
+        if (strcmp(g->kvs[i].key, key) == 0) return &g->kvs[i];
+    }
+    return NULL;
+}
+
+int slate_gguf_get_u32(const slate_gguf_t* g, const char* key, uint32_t* out) {
+    if (!g || !key || !out) return -1;
+    const gguf_kv_t* kv = find_kv(g, key);
+    if (!kv) return -2;
+    if (kv->type == GGUF_T_U32) { *out = kv->v.u32; return 0; }
+    if (kv->type == GGUF_T_I32) { *out = (uint32_t)kv->v.i32; return 0; }
+    if (kv->type == GGUF_T_U64) { *out = (uint32_t)kv->v.u64; return 0; }
+    return -3;
+}
+
+int slate_gguf_get_f32(const slate_gguf_t* g, const char* key, float* out) {
+    if (!g || !key || !out) return -1;
+    const gguf_kv_t* kv = find_kv(g, key);
+    if (!kv) return -2;
+    if (kv->type == GGUF_T_F32) { *out = kv->v.f32; return 0; }
+    return -3;
+}
+
+int slate_gguf_get_str(const slate_gguf_t* g, const char* key, const char** out) {
+    if (!g || !key || !out) return -1;
+    const gguf_kv_t* kv = find_kv(g, key);
+    if (!kv) return -2;
+    if (kv->type == GGUF_T_STRING) { *out = kv->v.str; return 0; }
+    return -3;
 }
